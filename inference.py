@@ -170,6 +170,8 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
                 break
 
             final_params_dict = inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine)
+            final_params_dict = stabilizer.smooth(final_params_dict)
+            
             if final_params_dict is not None:
                 P = projection_from_cam_params(final_params_dict)
                 projected_frame = project(frame, P)
