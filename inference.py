@@ -14,6 +14,7 @@ from matplotlib.patches import Polygon
 from model.cls_hrnet import get_cls_net
 from model.cls_hrnet_l import get_cls_net as get_cls_net_l
 
+from utils.temporal_stabilizer import TemporalStabilizer
 from utils.utils_calib import FramebyFrameCalib, pan_tilt_roll_to_orientation
 from utils.utils_heatmap import get_keypoints_from_heatmap_batch_maxpool, get_keypoints_from_heatmap_batch_maxpool_l, \
     complete_keypoints, coords_to_dict
@@ -145,7 +146,17 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
     cam = FramebyFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
-
+    stabilizer = TemporalStabilizer(
+        alpha=0.35,              # 35% new frame, 65% history
+        alpha_high_err=0.08,     # very conservative when error is high
+        max_pos_jump=20.0,       # meters
+        max_angle_jump=15.0,     # degrees
+        max_focal_jump=800.0,
+        max_rep_err=8.0,
+        reject_rep_err=15.0,
+        reset_after_reject=5,    # scene-cut detection
+    )
+                      
     if input_type == 'video':
         cap = cv2.VideoCapture(input_path)
         if save_path != "":
