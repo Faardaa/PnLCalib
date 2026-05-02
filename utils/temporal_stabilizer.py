@@ -13,11 +13,11 @@ class TemporalStabilizer:
     """
     def __init__(
         self,
-        alpha=0.35,               # EMA "learning rate" (0 = frozen, 1 = no smoothing)
+        alpha=0.15,               # EMA "learning rate" (0 = frozen, 1 = no smoothing)
         alpha_high_err=0.08,      # more conservative when reprojection error is high
         max_pos_jump=20.0,        # meters; broadcast cams don't teleport 20m in 1 frame
         max_angle_jump=15.0,      # degrees
-        max_focal_jump=800.0,     # pixels
+        max_focal_jump=500.0,     # pixels
         max_rep_err=8.0,          # px threshold for "good" frame
         reject_rep_err=15.0,      # px threshold for hard rejection
         reset_after_reject=5,     # allow reset after N consecutive rejects (scene cut)
