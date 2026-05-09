@@ -19,7 +19,102 @@ from utils.utils_calib import FramebyFrameCalib, pan_tilt_roll_to_orientation
 from utils.utils_heatmap import get_keypoints_from_heatmap_batch_maxpool, get_keypoints_from_heatmap_batch_maxpool_l, \
     complete_keypoints, coords_to_dict
 
+# ═══════════════════════════════════════════════════════════════
+# PATCH 1: Mode-Locking Calibrator
+# ═══════════════════════════════════════════════════════════════
+class LockedFrameCalib(FramebyFrameCalib):
+    """
+    Extends FramebyFrameCalib to lock the calibration mode once found.
+    This prevents frame-to-frame mode switching which causes drastic shifts.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.locked_mode = None          # e.g. 'full', 'ground_plane', 'main'
+        self.locked_ransac = None        # e.g. 0, 5, 10
+        self.locked_plane = None         # calibration plane index
 
+    def heuristic_voting_locked(self, refine=False, refine_lines=False):
+        """
+        Mode-locked version of heuristic_voting.
+
+        Strategy:
+        1. If we have a locked mode, try it FIRST with RANSAC=0 (most stable)
+        2. If that fails, try locked mode with original RANSAC value
+        3. If still failing, fall back to full heuristic search
+        4. On fallback success, re-lock to the new mode
+        """
+        # ── Phase 1: Try locked mode with RANSAC=0 (cleanest) ──
+        if self.locked_mode is not None:
+            cam_params, rep_err = self.get_cam_params(
+                mode=self.locked_mode,
+                use_ransac=0,
+                refine=refine,
+                refine_w_lines=refine_lines
+            )
+            if cam_params is not None and rep_err is not None and not np.isnan(rep_err):
+                # Success! Stay locked.
+                return {
+                    'mode': self.locked_mode,
+                    'use_ransac': 0,
+                    'rep_err': rep_err,
+                    'cam_params': cam_params,
+                    'calib_plane': self.ord_pts[0] if hasattr(self, 'ord_pts') else 0
+                }
+
+        # ── Phase 2: Try locked mode with original RANSAC ──
+        if self.locked_mode is not None and self.locked_ransac is not None and self.locked_ransac != 0:
+            cam_params, rep_err = self.get_cam_params(
+                mode=self.locked_mode,
+                use_ransac=self.locked_ransac,
+                refine=refine,
+                refine_w_lines=refine_lines
+            )
+            if cam_params is not None and rep_err is not None and not np.isnan(rep_err):
+                return {
+                    'mode': self.locked_mode,
+                    'use_ransac': self.locked_ransac,
+                    'rep_err': rep_err,
+                    'cam_params': cam_params,
+                    'calib_plane': self.ord_pts[0] if hasattr(self, 'ord_pts') else 0
+                }
+
+        # ── Phase 3: Full fallback ──
+        result = self.heuristic_voting(refine=refine, refine_lines=refine_lines)
+
+        # ── Phase 4: Lock to whatever the fallback found ──
+        if result is not None:
+            self.locked_mode = result.get('mode')
+            self.locked_ransac = result.get('use_ransac')
+            self.locked_plane = result.get('calib_plane')
+
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# PATCH 2: Tightened Temporal Stabilizer
+# ═══════════════════════════════════════════════════════════════
+class TightTemporalStabilizer(TemporalStabilizer):
+    """
+    Pre-configured stabilizer with broadcast-sports-tuned parameters.
+    Inherits all logic from TemporalStabilizer, just sets better defaults.
+    """
+    def __init__(self, verbose=False):
+        super().__init__(
+            alpha=0.10,              # Heavy smoothing: 90% history, 10% new
+            alpha_high_err=0.03,      # Very conservative when error is high
+            max_pos_jump=2.5,         # ~0.1m/frame at normal pan speed
+            max_angle_jump=4.0,       # ~0.16°/frame
+            max_focal_jump=100.0,     # Focal length shouldn't jump much
+            max_rep_err=6.0,          # Stricter "good" threshold
+            reject_rep_err=12.0,      # Hard reject bad frames
+            reset_after_reject=8,     # Need more evidence for scene cut
+            verbose=verbose,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ORIGINAL CODE (unchanged below this line)
+# ═══════════════════════════════════════════════════════════════
 lines_coords = [[[0., 54.16, 0.], [16.5, 54.16, 0.]],
                 [[16.5, 13.84, 0.], [16.5, 54.16, 0.]],
                 [[16.5, 13.84, 0.], [0., 13.84, 0.]],
@@ -77,20 +172,20 @@ def inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refi
         heatmaps = model(frame)
         heatmaps_l = model_l(frame)
 
-    kp_coords = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:,:-1,:,:])
-    line_coords = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:,:-1,:,:])
+    kp_coords = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:, :-1, :, :])
+    line_coords = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:, :-1, :, :])
     kp_dict = coords_to_dict(kp_coords, threshold=kp_threshold)
     lines_dict = coords_to_dict(line_coords, threshold=line_threshold)
     kp_dict, lines_dict = complete_keypoints(kp_dict[0], lines_dict[0], w=w, h=h, normalize=True)
 
     cam.update(kp_dict, lines_dict)
-    final_params_dict = cam.heuristic_voting(refine_lines=pnl_refine)
+    # ── CHANGED: use locked heuristic instead of vanilla ──
+    final_params_dict = cam.heuristic_voting_locked(refine_lines=pnl_refine)
 
     return final_params_dict
 
 
 def project(frame, P):
-
     for line in lines_coords:
         w1 = line[0]
         w2 = line[1]
@@ -145,18 +240,12 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-    cam = FramebyFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
-    stabilizer = TemporalStabilizer(
-        alpha=0.35,              # 35% new frame, 65% history
-        alpha_high_err=0.08,     # very conservative when error is high
-        max_pos_jump=20.0,       # meters
-        max_angle_jump=15.0,     # degrees
-        max_focal_jump=800.0,
-        max_rep_err=8.0,
-        reject_rep_err=15.0,
-        reset_after_reject=5,    # scene-cut detection
-    )
-                      
+    # ── CHANGED: use LockedFrameCalib instead of FramebyFrameCalib ──
+    cam = LockedFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
+
+    # ── CHANGED: use TightTemporalStabilizer with broadcast-tuned params ──
+    stabilizer = TightTemporalStabilizer()
+
     if input_type == 'video':
         cap = cv2.VideoCapture(input_path)
         if save_path != "":
@@ -171,21 +260,21 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
 
             final_params_dict = inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine)
             final_params_dict = stabilizer.smooth(final_params_dict)
-            
+
             if final_params_dict is not None:
                 P = projection_from_cam_params(final_params_dict)
                 projected_frame = project(frame, P)
             else:
                 projected_frame = frame
-                
+
             if save_path != "":
                 out.write(projected_frame)
-    
+
             if display:
                 cv2.imshow('Projected Frame', projected_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-            
+
             pbar.update(1)
 
         cap.release()
@@ -213,6 +302,7 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
             plt.axis('off')
             plt.show()
 
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Process video or image and plot lines on each frame.")
@@ -228,7 +318,6 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=str, default="", help="Path to save the processed video.")
     parser.add_argument("--display", action="store_true", help="Enable real-time display.")
     args = parser.parse_args()
-
 
     input_path = args.input_path
     input_type = args.input_type
