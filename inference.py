@@ -3,6 +3,7 @@ import yaml
 import torch
 import argparse
 import numpy as np
+import json
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
 import torchvision.transforms.functional as f
@@ -14,131 +15,33 @@ from matplotlib.patches import Polygon
 from model.cls_hrnet import get_cls_net
 from model.cls_hrnet_l import get_cls_net as get_cls_net_l
 
-from utils.temporal_stabilizer import TemporalStabilizer
 from utils.utils_calib import FramebyFrameCalib, pan_tilt_roll_to_orientation
 from utils.utils_heatmap import get_keypoints_from_heatmap_batch_maxpool, get_keypoints_from_heatmap_batch_maxpool_l, \
     complete_keypoints, coords_to_dict
 
-# ═══════════════════════════════════════════════════════════════
-# PATCH 1: Mode-Locking Calibrator
-# ═══════════════════════════════════════════════════════════════
-class LockedFrameCalib(FramebyFrameCalib):
-    """
-    Extends FramebyFrameCalib to lock the calibration mode once found.
-    This prevents frame-to-frame mode switching which causes drastic shifts.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.locked_mode = None          # e.g. 'full', 'ground_plane', 'main'
-        self.locked_ransac = None        # e.g. 0, 5, 10
-        self.locked_plane = None         # calibration plane index
-
-    def heuristic_voting_locked(self, refine=False, refine_lines=False):
-        """
-        Mode-locked version of heuristic_voting.
-
-        Strategy:
-        1. If we have a locked mode, try it FIRST with RANSAC=0 (most stable)
-        2. If that fails, try locked mode with original RANSAC value
-        3. If still failing, fall back to full heuristic search
-        4. On fallback success, re-lock to the new mode
-        """
-        # ── Phase 1: Try locked mode with RANSAC=0 (cleanest) ──
-        if self.locked_mode is not None:
-            cam_params, rep_err = self.get_cam_params(
-                mode=self.locked_mode,
-                use_ransac=0,
-                refine=refine,
-                refine_w_lines=refine_lines
-            )
-            if cam_params is not None and rep_err is not None and not np.isnan(rep_err):
-                # Success! Stay locked.
-                return {
-                    'mode': self.locked_mode,
-                    'use_ransac': 0,
-                    'rep_err': rep_err,
-                    'cam_params': cam_params,
-                    'calib_plane': self.ord_pts[0] if hasattr(self, 'ord_pts') else 0
-                }
-
-        # ── Phase 2: Try locked mode with original RANSAC ──
-        if self.locked_mode is not None and self.locked_ransac is not None and self.locked_ransac != 0:
-            cam_params, rep_err = self.get_cam_params(
-                mode=self.locked_mode,
-                use_ransac=self.locked_ransac,
-                refine=refine,
-                refine_w_lines=refine_lines
-            )
-            if cam_params is not None and rep_err is not None and not np.isnan(rep_err):
-                return {
-                    'mode': self.locked_mode,
-                    'use_ransac': self.locked_ransac,
-                    'rep_err': rep_err,
-                    'cam_params': cam_params,
-                    'calib_plane': self.ord_pts[0] if hasattr(self, 'ord_pts') else 0
-                }
-
-        # ── Phase 3: Full fallback ──
-        result = self.heuristic_voting(refine=refine, refine_lines=refine_lines)
-
-        # ── Phase 4: Lock to whatever the fallback found ──
-        if result is not None:
-            self.locked_mode = result.get('mode')
-            self.locked_ransac = result.get('use_ransac')
-            self.locked_plane = result.get('calib_plane')
-
-        return result
-
-
-# ═══════════════════════════════════════════════════════════════
-# PATCH 2: Tightened Temporal Stabilizer
-# ═══════════════════════════════════════════════════════════════
-class TightTemporalStabilizer(TemporalStabilizer):
-    """
-    Pre-configured stabilizer with broadcast-sports-tuned parameters.
-    Inherits all logic from TemporalStabilizer, just sets better defaults.
-    """
-    def __init__(self, verbose=False):
-        super().__init__(
-            alpha=0.10,              # Heavy smoothing: 90% history, 10% new
-            alpha_high_err=0.03,      # Very conservative when error is high
-            max_pos_jump=2.5,         # ~0.1m/frame at normal pan speed
-            max_angle_jump=4.0,       # ~0.16°/frame
-            max_focal_jump=100.0,     # Focal length shouldn't jump much
-            max_rep_err=6.0,          # Stricter "good" threshold
-            reject_rep_err=12.0,      # Hard reject bad frames
-            reset_after_reject=8,     # Need more evidence for scene cut
-            verbose=verbose,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════
-# ORIGINAL CODE (unchanged below this line)
-# ═══════════════════════════════════════════════════════════════
 lines_coords = [[[0., 54.16, 0.], [16.5, 54.16, 0.]],
-                [[16.5, 13.84, 0.], [16.5, 54.16, 0.]],
-                [[16.5, 13.84, 0.], [0., 13.84, 0.]],
-                [[88.5, 54.16, 0.], [105., 54.16, 0.]],
-                [[88.5, 13.84, 0.], [88.5, 54.16, 0.]],
-                [[88.5, 13.84, 0.], [105., 13.84, 0.]],
-                [[0., 37.66, -2.44], [0., 30.34, -2.44]],
-                [[0., 37.66, 0.], [0., 37.66, -2.44]],
-                [[0., 30.34, 0.], [0., 30.34, -2.44]],
-                [[105., 37.66, -2.44], [105., 30.34, -2.44]],
-                [[105., 30.34, 0.], [105., 30.34, -2.44]],
-                [[105., 37.66, 0.], [105., 37.66, -2.44]],
-                [[52.5, 0., 0.], [52.5, 68, 0.]],
-                [[0., 68., 0.], [105., 68., 0.]],
-                [[0., 0., 0.], [0., 68., 0.]],
-                [[105., 0., 0.], [105., 68., 0.]],
-                [[0., 0., 0.], [105., 0., 0.]],
-                [[0., 43.16, 0.], [5.5, 43.16, 0.]],
-                [[5.5, 43.16, 0.], [5.5, 24.84, 0.]],
-                [[5.5, 24.84, 0.], [0., 24.84, 0.]],
-                [[99.5, 43.16, 0.], [105., 43.16, 0.]],
-                [[99.5, 43.16, 0.], [99.5, 24.84, 0.]],
-                [[99.5, 24.84, 0.], [105., 24.84, 0.]]]
-
+    [[16.5, 13.84, 0.], [16.5, 54.16, 0.]],
+    [[16.5, 13.84, 0.], [0., 13.84, 0.]],
+    [[88.5, 54.16, 0.], [105., 54.16, 0.]],
+    [[88.5, 13.84, 0.], [88.5, 54.16, 0.]],
+    [[88.5, 13.84, 0.], [105., 13.84, 0.]],
+    [[0., 37.66, -2.44], [0., 30.34, -2.44]],
+    [[0., 37.66, 0.], [0., 37.66, -2.44]],
+    [[0., 30.34, 0.], [0., 30.34, -2.44]],
+    [[105., 37.66, -2.44], [105., 30.34, -2.44]],
+    [[105., 30.34, 0.], [105., 30.34, -2.44]],
+    [[105., 37.66, 0.], [105., 37.66, -2.44]],
+    [[52.5, 0., 0.], [52.5, 68, 0.]],
+    [[0., 68., 0.], [105., 68., 0.]],
+    [[0., 0., 0.], [0., 68., 0.]],
+    [[105., 0., 0.], [105., 68., 0.]],
+    [[0., 0., 0.], [105., 0., 0.]],
+    [[0., 43.16, 0.], [5.5, 43.16, 0.]],
+    [[5.5, 43.16, 0.], [5.5, 24.84, 0.]],
+    [[5.5, 24.84, 0.], [0., 24.84, 0.]],
+    [[99.5, 43.16, 0.], [105., 43.16, 0.]],
+    [[99.5, 43.16, 0.], [99.5, 24.84, 0.]],
+    [[99.5, 24.84, 0.], [105., 24.84, 0.]]]
 
 def projection_from_cam_params(final_params_dict):
     cam_params = final_params_dict["cam_params"]
@@ -157,7 +60,6 @@ def projection_from_cam_params(final_params_dict):
 
     return P
 
-
 def inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame = Image.fromarray(frame)
@@ -172,20 +74,19 @@ def inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refi
         heatmaps = model(frame)
         heatmaps_l = model_l(frame)
 
-    kp_coords = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:, :-1, :, :])
-    line_coords = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:, :-1, :, :])
+    kp_coords = get_keypoints_from_heatmap_batch_maxpool(heatmaps[:,:-1,:,:])
+    line_coords = get_keypoints_from_heatmap_batch_maxpool_l(heatmaps_l[:,:-1,:,:])
     kp_dict = coords_to_dict(kp_coords, threshold=kp_threshold)
     lines_dict = coords_to_dict(line_coords, threshold=line_threshold)
     kp_dict, lines_dict = complete_keypoints(kp_dict[0], lines_dict[0], w=w, h=h, normalize=True)
 
     cam.update(kp_dict, lines_dict)
-    # ── CHANGED: use locked heuristic instead of vanilla ──
-    final_params_dict = cam.heuristic_voting_locked(refine_lines=pnl_refine)
+    final_params_dict = cam.heuristic_voting(refine_lines=pnl_refine)
 
     return final_params_dict
 
-
 def project(frame, P):
+
     for line in lines_coords:
         w1 = line[0]
         w2 = line[1]
@@ -230,9 +131,8 @@ def project(frame, P):
 
     return frame
 
-
 def process_input(input_path, input_type, model_kp, model_line, kp_threshold, line_threshold, pnl_refine,
-                  save_path, display):
+                  save_path, display, json_output=None):
 
     cap = cv2.VideoCapture(input_path)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -240,11 +140,9 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-    # ── CHANGED: use LockedFrameCalib instead of FramebyFrameCalib ──
-    cam = LockedFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
+    cam = FramebyFrameCalib(iwidth=frame_width, iheight=frame_height, denormalize=True)
 
-    # ── CHANGED: use TightTemporalStabilizer with broadcast-tuned params ──
-    stabilizer = TightTemporalStabilizer()
+    json_frames = []
 
     if input_type == 'video':
         cap = cv2.VideoCapture(input_path)
@@ -252,6 +150,7 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
             out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
 
         pbar = tqdm(total=total_frames)
+        frame_idx = 0
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -259,7 +158,18 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
                 break
 
             final_params_dict = inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine)
-            final_params_dict = stabilizer.smooth(final_params_dict)
+
+            frame_record = {
+                "frame_idx": frame_idx,
+                "valid": final_params_dict is not None
+            }
+            if final_params_dict is not None:
+                frame_record["cam_params"] = final_params_dict["cam_params"]
+                frame_record["rep_err"] = float(final_params_dict.get("rep_err", 0.0))
+                frame_record["mode"] = final_params_dict.get("mode", "unknown")
+                frame_record["use_ransac"] = final_params_dict.get("use_ransac", 0)
+                frame_record["calib_plane"] = final_params_dict.get("calib_plane", 0)
+            json_frames.append(frame_record)
 
             if final_params_dict is not None:
                 P = projection_from_cam_params(final_params_dict)
@@ -276,11 +186,27 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
                     break
 
             pbar.update(1)
+            frame_idx += 1
 
         cap.release()
         if save_path != "":
             out.release()
         cv2.destroyAllWindows()
+
+        if json_output is not None and len(json_frames) > 0:
+            import os
+            os.makedirs(os.path.dirname(json_output) if os.path.dirname(json_output) else ".", exist_ok=True)
+            with open(json_output, 'w') as f:
+                json.dump({
+                    "video_path": str(input_path),
+                    "total_frames": total_frames,
+                    "fps": fps,
+                    "frame_width": frame_width,
+                    "frame_height": frame_height,
+                    "pnl_refine": pnl_refine,
+                    "frames": json_frames
+                }, f, indent=2, default=lambda o: float(o) if isinstance(o, np.floating) else o)
+            print(f"\n✅ JSON saved to: {json_output}")
 
     elif input_type == 'image':
         frame = cv2.imread(input_path)
@@ -289,6 +215,18 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
             return
 
         final_params_dict = inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refine)
+
+        json_record = {
+            "image_path": str(input_path),
+            "valid": final_params_dict is not None
+        }
+        if final_params_dict is not None:
+            json_record["cam_params"] = final_params_dict["cam_params"]
+            json_record["rep_err"] = float(final_params_dict.get("rep_err", 0.0))
+            json_record["mode"] = final_params_dict.get("mode", "unknown")
+            json_record["use_ransac"] = final_params_dict.get("use_ransac", 0)
+            json_record["calib_plane"] = final_params_dict.get("calib_plane", 0)
+
         if final_params_dict is not None:
             P = projection_from_cam_params(final_params_dict)
             projected_frame = project(frame, P)
@@ -302,6 +240,12 @@ def process_input(input_path, input_type, model_kp, model_line, kp_threshold, li
             plt.axis('off')
             plt.show()
 
+        if json_output is not None:
+            import os
+            os.makedirs(os.path.dirname(json_output) if os.path.dirname(json_output) else ".", exist_ok=True)
+            with open(json_output, 'w') as f:
+                json.dump(json_record, f, indent=2, default=lambda o: float(o) if isinstance(o, np.floating) else o)
+            print(f"\n✅ JSON saved to: {json_output}")
 
 if __name__ == "__main__":
 
@@ -317,6 +261,7 @@ if __name__ == "__main__":
                         help="Type of input: 'video' or 'image'.")
     parser.add_argument("--save_path", type=str, default="", help="Path to save the processed video.")
     parser.add_argument("--display", action="store_true", help="Enable real-time display.")
+    parser.add_argument("--json_output", type=str, default=None, help="Path to save per-frame camera params as JSON.")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -329,6 +274,7 @@ if __name__ == "__main__":
     display = args.display and input_type == 'video'
     kp_threshold = args.kp_threshold
     line_threshold = args.line_threshold
+    json_output = args.json_output
 
     cfg = yaml.safe_load(open("config/hrnetv2_w48.yaml", 'r'))
     cfg_l = yaml.safe_load(open("config/hrnetv2_w48_l.yaml", 'r'))
@@ -348,4 +294,4 @@ if __name__ == "__main__":
     transform2 = T.Resize((540, 960))
 
     process_input(input_path, input_type, model_kp, model_line, kp_threshold, line_threshold, pnl_refine,
-                  save_path, display)
+                  save_path, display, json_output)
